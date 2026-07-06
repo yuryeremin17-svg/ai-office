@@ -1,0 +1,11 @@
+# секреты и рабочее состояние клиента — никогда не коммитить
+.office-env
+*token*
+*.key
+*.pem
+.openclaw/
+# логи и временное
+*.log
+# рабочая память офиса (если кто-то инициализирует git в /root/office)
+memory/*.md
+!workspace/memory/.gitkeep
