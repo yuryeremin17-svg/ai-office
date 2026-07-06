@@ -12,7 +12,7 @@
 На чистом сервере Ubuntu 22.04/24.04 (1 CPU / 2 ГБ) выполните две команды в консоли сервера:
 
 ```
-git clone <URL-РЕПОЗИТОРИЯ> /root/office-src
+git clone https://github.com/yuryeremin17-svg/ai-office.git /root/office-src
 cd /root/office-src && sudo bash install.sh
 ```
 
