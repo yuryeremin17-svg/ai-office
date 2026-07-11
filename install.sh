@@ -69,8 +69,13 @@ GETME=$(curl -s -m 15 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 
 echo "$GETME" | grep -q '"ok":true' || die "токен бота невалиден (Telegram отклонил запрос)"
 BOT_USER=$(echo "$GETME" | grep -o '"username":"[^"]*"' | sed 's/.*:"//;s/"$//')
 ok "бот: @${BOT_USER}"
-FREE=$(curl -s "https://openrouter.ai/api/v1/key" -H "Authorization: Bearer ${OPENROUTER_API_KEY}" | grep -o '"is_free_tier":[a-z]*' || true)
-echo "$FREE" | grep -q true && printf "\033[0;31m  ⚠ OpenRouter на free-tier — платные модели не работают, пополните баланс!\033[0m\n"
+KEYINFO=$(curl -s "https://openrouter.ai/api/v1/key" -H "Authorization: Bearer ${OPENROUTER_API_KEY}")
+echo "$KEYINFO" | grep -o '"is_free_tier":[a-z]*' | grep -q true && printf "\033[0;31m  ⚠ OpenRouter на free-tier — платные модели не работают, пополните баланс!\033[0m\n"
+# Остаток баланса: если задан лимит и осталось мало — предупредить (иначе бот замолчит через день-два)
+REMAIN=$(echo "$KEYINFO" | python3 -c "import sys,json;d=json.load(sys.stdin).get('data',{});r=d.get('limit_remaining');print(r if r is not None else '')" 2>/dev/null || echo '')
+if [ -n "$REMAIN" ]; then
+  awk -v r="$REMAIN" 'BEGIN{exit !(r<3)}' && printf "\033[0;31m  ⚠ На ключе OpenRouter осталось ~\$%s — мало, бот скоро замолчит. Пополните до старта работы клиента.\033[0m\n" "$REMAIN" || ok "баланс OpenRouter: ~\$${REMAIN}"
+fi
 
 # --- 2. Установка OpenClaw ---------------------------------------------------
 say "Шаг 2/9 — установка OpenClaw"
@@ -100,16 +105,20 @@ cat > "$PATCH" <<JSON
     "model": { "primary": "${MODEL_PRIMARY}",
                "fallbacks": ["${MODEL_FALLBACK}"] },
     "thinkingDefault": "off",
+    "maxConcurrent": 1,
     "contextTokens": 48000,
     "compaction": { "mode": "default" },
     "contextPruning": { "mode": "cache-ttl", "keepLastAssistants": 8, "softTrimRatio": 0.7, "hardClearRatio": 0.9 }
   }},
+  "messages": { "inbound": { "debounceMs": 2000 } },
   "tools": {
     "profile": "full",
-    "deny": ["gateway","exec","process","subagents","sessions_spawn","apply_patch","nodes","skill_workshop"],
+    "deny": ["gateway","exec","process","subagents","sessions_spawn","apply_patch","nodes","skill_workshop","browser"],
     "elevated": { "enabled": false },
-    "loopDetection": { "enabled": true }
+    "loopDetection": { "enabled": true },
+    "web": { "search": { "enabled": true, "provider": "duckduckgo", "maxResults": 5, "cacheTtlMinutes": 15 } }
   },
+  "cron": { "enabled": true },
   "channels": { "telegram": {
     "enabled": true,
     "botToken": "${TELEGRAM_BOT_TOKEN}",
@@ -120,9 +129,13 @@ cat > "$PATCH" <<JSON
       { "command": "start",    "description": "Знакомство: кто я и что умею" },
       { "command": "fokus",    "description": "Фокус дня — 3 задачи из хаоса" },
       { "command": "zadacha",  "description": "Разобрать задачу по шагам" },
+      { "command": "proekt",   "description": "Вести проект: этапы, сроки, статус" },
       { "command": "pismo",    "description": "Помочь с деловым письмом" },
+      { "command": "dokument", "description": "Разобрать документ или PDF" },
       { "command": "proverit", "description": "Проверить текст перед отправкой" },
       { "command": "razbor",   "description": "Разобрать вопрос или тему" },
+      { "command": "rynok",    "description": "Разбор рынка и конкурентов" },
+      { "command": "dengi",    "description": "Экономика решения, окупаемость" },
       { "command": "pomosh",   "description": "Что я умею" }
     ]
   }}
@@ -170,9 +183,13 @@ cat > "$MENU_DIR/office-menu.json" <<'MENU'
 {"command":"start","description":"Знакомство: кто я и что умею"},
 {"command":"fokus","description":"Фокус дня — 3 задачи из хаоса"},
 {"command":"zadacha","description":"Разобрать задачу по шагам"},
+{"command":"proekt","description":"Вести проект: этапы, сроки, статус"},
 {"command":"pismo","description":"Помочь с деловым письмом"},
+{"command":"dokument","description":"Разобрать документ или PDF"},
 {"command":"proverit","description":"Проверить текст перед отправкой"},
 {"command":"razbor","description":"Разобрать вопрос или тему"},
+{"command":"rynok","description":"Разбор рынка и конкурентов"},
+{"command":"dengi","description":"Экономика решения, окупаемость"},
 {"command":"new","description":"🔄 Новый диалог — обнулить контекст (дешевле)"},
 {"command":"compact","description":"Сжать контекст — оставить суть"},
 {"command":"model","description":"Сменить мозг — умный / экономный"},
