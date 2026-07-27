@@ -18,6 +18,8 @@ ok()  { printf "\033[0;32m  ✓ %s\033[0m\n" "$1"; }
 die() { printf "\n\033[0;31m✗ %s\033[0m\n" "$1"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # наша сборка (git-репо, останется для обновлений)
+# shellcheck source=lib.sh
+. "$SCRIPT_DIR/lib.sh"                                       # разбор версии движка и чтение его логов — одни на всю болванку
 OFFICE_DIR="/root/office"                                    # рабочая папка: ЛИЧНОЕ клиента живёт тут
 # Сборка и рабочая папка не должны совпадать — иначе обновление перемешает наше с личным.
 [ "$SCRIPT_DIR" = "$OFFICE_DIR" ] && die "склонируйте сборку в /root/office-src (не в /root/office) и запустите оттуда"
@@ -79,11 +81,54 @@ fi
 
 # --- 2. Установка OpenClaw ---------------------------------------------------
 say "Шаг 2/9 — установка OpenClaw"
+# git нужен обновлялке (update.sh git pull раз в неделю). На голом сервере/из
+# cloud-init его может не быть — доставляем заранее, тихо.
+apt_wait 300 || printf "  (apt занят автообновлениями дольше обычного — продолжаю)\n"
+command -v git >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git >/dev/null 2>&1 || true; }
+
+# Node нужной версии — ДО установщика движка. Если в образе сервера лежит старый
+# дистрибутивный Node (у DigitalOcean 27.07 приехал v12), установщик движка падает
+# проверкой версии, и клиент упирается в непонятную ошибку на середине установки.
+bash "$SCRIPT_DIR/ensure-node.sh" 22 || die "нужен Node 22+, поставить не удалось — напишите нам, поможем"
+
+# Пин движка: держим протестированную версию (фикс P0 session conflict — ≥2026.6.11).
+# Читаем ДО установки, чтобы поставить нужную версию сразу: установщик движка принимает
+# `--version`. Иначе идёт лишний цикл latest → downgrade (прогон 24.07: +минуты к установке).
+PIN=$(tr -d '[:space:]' < "$SCRIPT_DIR/ENGINE_VERSION" 2>/dev/null || echo '')
+
 if ! command -v openclaw >/dev/null 2>&1; then
-  curl -fsSL https://openclaw.ai/install.sh | bash
+  if [ -n "$PIN" ]; then
+    curl -fsSL https://openclaw.ai/install.sh | bash -s -- --version "$PIN"
+  else
+    curl -fsSL https://openclaw.ai/install.sh | bash
+  fi
+  # Свежеустановленный бинарь может лежать вне PATH неинтерактивной оболочки
+  # (cloud-init, curl|bash). Добавляем типовые каталоги и сбрасываем кэш путей.
+  export PATH="$PATH:$HOME/.local/bin:/usr/local/bin:/root/.local/bin:/root/.npm-global/bin"
+  hash -r 2>/dev/null || true
 fi
-command -v openclaw >/dev/null 2>&1 || die "openclaw не установился"
-ok "OpenClaw $(openclaw --version 2>/dev/null | head -1)"
+command -v openclaw >/dev/null 2>&1 || die "openclaw не установился (или не найден в PATH)"
+
+# Страховка: если версия всё же разошлась с пином (движок уже стоял, или --version не сработал) — довести.
+# Версию читаем через engine_version() из lib.sh — она берёт номер ЦЕЛИКОМ, вместе с
+# суффиксом сборки. Прежний разбор терял «-2» в «2026.7.1-2»: пин фактически стоял,
+# а установщик печатал «не удалось запинить» и строкой ниже — верную версию (прогон 27.07).
+if [ -n "$PIN" ]; then
+  ev_cur=$(engine_version || echo '')
+  if [ "$ev_cur" != "$PIN" ]; then
+    say "Пин движка: $ev_cur → $PIN"
+    openclaw update --yes --no-restart --tag "$PIN" >/dev/null 2>&1 || true
+    # Судим по ФАКТИЧЕСКОЙ версии, а не по коду возврата update: на прогоне 24.07 команда
+    # вернула ненулевой код, хотя пин реально встал → клиент видел ложную тревогу.
+    ev_new=$(engine_version || echo '')
+    if [ "$ev_new" = "$PIN" ]; then
+      ok "движок запинен на $PIN"
+    else
+      printf "\033[0;31m  ⚠ не удалось запинить движок на %s (остаётся %s) — проверьте вручную\033[0m\n" "$PIN" "${ev_new:-неизвестно}"
+    fi
+  fi
+fi
+ok "$(openclaw --version 2>/dev/null | head -1)"
 
 # --- 3. Болванка офиса (две полки: наше / личное клиента) --------------------
 # SCRIPT_DIR = наша сборка (git-репо, обновляется). OFFICE_DIR = рабочая папка,
@@ -173,6 +218,28 @@ loginctl enable-linger "$(whoami)" >/dev/null 2>&1 || true
 # дождаться готовности user-manager, иначе systemctl --user не подхватит таймеры (гонка на свежем сервере)
 for _ in $(seq 1 15); do systemctl --user is-system-running >/dev/null 2>&1 && break; sleep 1; done
 
+# Первый запуск на чистом диске прогоняет стартовые миграции (~2 мин) и держит лок
+# state-dir. Дефолтные Restart=always + RestartSec=5 успевают за это окно сделать
+# ~10 попыток, каждая утыкается в лок, systemd упирается в лимит стартов и бросает
+# службу в failed — офис не встаёт вообще. Лок при этом истекает уже ПОСЛЕ того,
+# как systemd сдался (живой прогон 26.07, дроплет progon-faza3).
+# Лечим не хаком в движке, а настройкой рестартов: лимит снимаем, паузу увеличиваем —
+# очередная попытка приходит уже на свободный state-dir. Файл в drop-in, сам unit
+# движка не трогаем: его переписывает `openclaw daemon install` при обновлении.
+GW_DROPIN_DIR="$HOME/.config/systemd/user/openclaw-gateway.service.d"
+mkdir -p "$GW_DROPIN_DIR"
+cat > "$GW_DROPIN_DIR/office-startup.conf" <<'UNIT'
+[Unit]
+# 0 = не ограничивать частоту стартов: долгая первая миграция не должна
+# заканчиваться отказом systemd продолжать попытки.
+StartLimitIntervalSec=0
+[Service]
+# Пауза между попытками: 5 секунд били в лок десять раз подряд, 20 — дают миграции
+# закончиться за 5-6 попыток без выжигания лимита.
+RestartSec=20
+UNIT
+systemctl --user daemon-reload >/dev/null 2>&1 || true
+
 # Полное меню (11 команд, включая /new /compact /model /status). Движок вырезает эти
 # зарезервированные команды из своего меню — поэтому доставляем их через Telegram API
 # systemd-службой, которая доигрывает меню после каждого старта шлюза (перекрывает пуш движка).
@@ -222,18 +289,29 @@ UNIT
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 systemctl --user enable office-menu.service >/dev/null 2>&1 || true
 
-openclaw daemon restart >/dev/null 2>&1 || openclaw daemon start >/dev/null 2>&1 || true
-systemctl --user start office-menu.service >/dev/null 2>&1 || true
-ok "служба поднята (переживёт выход из SSH), меню доигрывается после старта"
+# Первый запуск ведём сами (см. first-start.sh): на чистом сервере движок делает
+# разовую настройку данных ~5 минут и запирает каталог состояния. Если позволить
+# systemd в это время перезапускать службу, получаем десяток холостых попыток в
+# логе и подход вплотную к лимиту ожидания (прогон 27.07). Стартуем по одной
+# попытке и ждём ровно столько, сколько движок просит в логе.
+if bash "$SCRIPT_DIR/first-start.sh" openclaw-gateway 720 20; then
+  systemctl --user start office-menu.service >/dev/null 2>&1 || true
+  ok "служба поднята (переживёт выход из SSH), меню доигрывается после старта"
+else
+  printf "\033[0;31m  ⚠ служба не вышла в рабочий режим за 12 минут — проверка на Шаге 9 покажет подробности\033[0m\n"
+fi
 
 # --- 8. Автообновление (будильник раз в неделю) -----------------------------
 say "Шаг 8/9 — автообновление офиса"
 # Окружение для обновлялки: где рабочая папка и куда слать пульс (пока выключен).
+# HEARTBEAT_URL берём из окружения (cloud-init задаёт наш датчик пульса).
+# Пусто → пульс выключен (heartbeat.sh тихо выходит). Не интерактивный запуск не трогает.
+: "${HEARTBEAT_URL:=}"
 cat > "$HOME/.openclaw/.office-env" <<ENV
 OFFICE_DIR="${OFFICE_DIR}"
 OFFICE_SRC="${SCRIPT_DIR}"
 OWNER_TG_ID="${OWNER_TG_ID}"
-HEARTBEAT_URL=""
+HEARTBEAT_URL="${HEARTBEAT_URL}"
 ENV
 chmod 600 "$HOME/.openclaw/.office-env"
 # Будильник: раз в неделю ночью зовёт update.sh из нашей сборки.
@@ -275,16 +353,50 @@ OnUnitActiveSec=15min
 [Install]
 WantedBy=timers.target
 UNIT
+# Сторож: каждые 2 минуты проверяет, не залипла ли очередь Telegram (баг движка —
+# при сообщениях впритык бот замолкает насмерть). Если залипла — чистит и рестартует
+# шлюз сам. Клиент ждёт минуту вместо «бот умер». Найдено живым прогоном 24.07.
+cat > "$HOME/.config/systemd/user/office-watchdog.service" <<UNIT
+[Unit]
+Description=OpenClaw office watchdog (heal stuck Telegram queue / session conflict)
+[Service]
+Type=oneshot
+ExecStart=${SCRIPT_DIR}/watchdog.sh
+TimeoutStartSec=120
+UNIT
+cat > "$HOME/.config/systemd/user/office-watchdog.timer" <<'UNIT'
+[Unit]
+Description=Run office watchdog every 2 minutes
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+[Install]
+WantedBy=timers.target
+UNIT
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 systemctl --user enable --now office-update.timer >/dev/null 2>&1 || true
 systemctl --user enable --now office-heartbeat.timer >/dev/null 2>&1 || true
-ok "будильник (обновление раз в неделю) и пульс (каждые 15 мин) поставлены"
+systemctl --user enable --now office-watchdog.timer >/dev/null 2>&1 || true
+ok "будильник (обновление раз в неделю), пульс (15 мин) и сторож (2 мин) поставлены"
 
 # --- 9. Проверка -------------------------------------------------------------
 say "Шаг 9/9 — проверка"
-sleep 8
-STATE=$(systemctl --user is-active openclaw-gateway 2>/dev/null || echo unknown)
-ok "служба: $STATE"
+
+# Ждём настоящей готовности: active и полминуты без новых перезапусков. Логика
+# вынесена в wait-ready.sh, чтобы её можно было проверить тестом с подставным
+# systemctl (tests/test-startup.sh) — на Маке systemd нет, а ошибка тут стоит
+# клиенту мёртвого офиса с зелёным рапортом.
+if bash "$SCRIPT_DIR/wait-ready.sh" openclaw-gateway 300 10; then
+  ok "служба: active и держится (перезапусков нет)"
+else
+  STATE=$(systemctl --user is-active openclaw-gateway 2>/dev/null || echo unknown)
+  printf "\n\033[0;31m  ⚠ Офис собран, но служба не вышла в рабочий режим (состояние: %s).\033[0m\n" "$STATE"
+  printf "  Что посмотреть: systemctl --user status openclaw-gateway\n"
+  printf "  Логи офиса: /tmp/openclaw/ и %s/office-watchdog.log\n" "$HOME/.openclaw"
+  printf "  Сторож попробует поднять службу сам в ближайшие 2 минуты.\n\n"
+  exit 1
+fi
+
 printf "\n\033[1;32m════════════════════════════════════════════\033[0m\n"
 printf "\033[1;32m  Офис готов. Напишите боту @%s → /start\033[0m\n" "${BOT_USER}"
 printf "\033[1;32m════════════════════════════════════════════\033[0m\n\n"

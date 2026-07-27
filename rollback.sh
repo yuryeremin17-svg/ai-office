@@ -11,6 +11,14 @@
 # ============================================================================
 set -euo pipefail
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# То же мягкое подключение, что в update.sh: откат может выполняться на сборке,
+# где lib.sh ещё нет (или уже нет — откатились на старую метку).
+if [ -f "$SRC_DIR/lib.sh" ]; then
+  # shellcheck source=lib.sh
+  . "$SRC_DIR/lib.sh"
+else
+  engine_version() { openclaw --version 2>/dev/null | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?' | head -1; }
+fi
 ENVF="$HOME/.openclaw/.office-env"; [ -f "$ENVF" ] && . "$ENVF" || true
 OFFICE_DIR="${OFFICE_DIR:-/root/office}"
 cd "$SRC_DIR"
@@ -35,6 +43,6 @@ bash "$SRC_DIR/office-sync.sh" "$SRC_DIR" "$OFFICE_DIR"
 openclaw daemon restart >/dev/null 2>&1 || openclaw daemon start >/dev/null 2>&1 || true
 
 echo "rollback: офис откачен на $TARGET и перезапущен (память клиента не тронута)."
-echo "  сборка: $(cat "$SRC_DIR/VERSION" 2>/dev/null || echo '?'); движок: $(openclaw --version 2>/dev/null | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+' | head -1 || echo '?')"
+echo "  сборка: $(cat "$SRC_DIR/VERSION" 2>/dev/null || echo '?'); движок: $(engine_version || echo '?')"
 echo "  ВНИМАНИЕ: автообновление приостановлено (открепились от ветки). Когда почините —"
 echo "  верните на ветку:  cd $SRC_DIR && git checkout master && bash update.sh"

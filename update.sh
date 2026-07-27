@@ -11,6 +11,15 @@
 # ============================================================================
 set -euo pipefail
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # наша git-сборка
+# engine_version(): версия ЦЕЛИКОМ, с суффиксом сборки. Мягко: у офисов, поставленных
+# до 27.07, lib.sh в сборке ещё нет — он приедет этим же обновлением, а до того
+# держим запасное определение, чтобы обновление не падало на переходном цикле.
+if [ -f "$SRC_DIR/lib.sh" ]; then
+  # shellcheck source=lib.sh
+  . "$SRC_DIR/lib.sh"
+else
+  engine_version() { openclaw --version 2>/dev/null | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?' | head -1; }
+fi
 LOG="$HOME/.openclaw/office-update.log"
 ENVF="$HOME/.openclaw/.office-env"
 [ -f "$ENVF" ] && . "$ENVF" || true                       # OFFICE_DIR, HEARTBEAT_URL
@@ -56,7 +65,11 @@ fi
 # строго на версию из ENGINE_VERSION (её мы предварительно проверили у себя).
 # Пусто = движок заморожен на версии установки, автообновление движка выключено.
 PIN=$(tr -d '[:space:]' < "$SRC_DIR/ENGINE_VERSION" 2>/dev/null || echo '')
-ev_cur=$(openclaw --version 2>/dev/null | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+' | head -1 || echo '?')
+# Версия ЦЕЛИКОМ: прежний разбор терял суффикс сборки («2026.7.1» вместо «2026.7.1-2»),
+# и еженедельное обновление каждую неделю считало бы версию разошедшейся с пином —
+# гоняло бы update вхолостую на офисе клиента (найдено на прогоне 27.07).
+ev_cur=$(engine_version || echo '')
+[ -z "$ev_cur" ] && ev_cur='?'
 if [ -z "$PIN" ]; then
   log "движок: версия не закреплена — автообновление движка выключено, оставляю $ev_cur"
 elif [ "$ev_cur" = "?" ]; then
