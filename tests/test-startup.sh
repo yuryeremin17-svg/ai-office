@@ -314,6 +314,55 @@ if bash "$ROOT/ensure-node.sh" 22 >/dev/null; then
 fi
 echo "✓ неудача с Node не выдаётся за успех"
 
+# ─── 14. Мозг определяем сами, человека не спрашиваем ──────────────────────
+# Раньше установщик спрашивал «Вы в России?» — вопрос неправильный: доступ
+# к моделям зависит от аккаунта OpenRouter, а не от места жительства. Клиент
+# из Москвы с зарубежным аккаунтом получал слабый мозг, а с российским —
+# молчащего бота. Теперь спрашиваем сам OpenRouter, ровно как бот-установщик.
+HTTP_CODES="$WORK/http_codes"; export HTTP_CODES
+cat > "$WORK/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+# отдаёт коды по очереди из файла: первая строка — ответ на первую пробу
+codes=$(cat "$HTTP_CODES"); first=$(echo "$codes" | head -1)
+echo "$codes" | tail -n +2 > "$HTTP_CODES"
+printf '%s' "$first"
+exit 0
+STUB
+chmod +x "$WORK/bin/curl"
+
+printf '200\n' > "$HTTP_CODES"
+[ "$(bash "$ROOT/detect-brain.sh" sk-or-test 2>/dev/null)" = "global" ] \
+  || fail "при доступной сильной модели должен ставиться обычный мозг"
+
+printf '403\n200\n' > "$HTTP_CODES"
+[ "$(bash "$ROOT/detect-brain.sh" sk-or-test 2>/dev/null)" = "ru" ] \
+  || fail "закрытая модель (403) → DeepSeek, без вопросов человеку"
+
+printf '404\n200\n' > "$HTTP_CODES"
+[ "$(bash "$ROOT/detect-brain.sh" sk-or-test 2>/dev/null)" = "ru" ] \
+  || fail "404 (нет доступного эндпоинта) тоже означает DeepSeek"
+
+# Сеть молчит — не повод давать клиенту слабый мозг
+printf '000\n' > "$HTTP_CODES"
+[ "$(bash "$ROOT/detect-brain.sh" sk-or-test 2>/dev/null)" = "global" ] \
+  || fail "сетевой сбой не должен понижать мозг"
+printf '429\n' > "$HTTP_CODES"
+[ "$(bash "$ROOT/detect-brain.sh" sk-or-test 2>/dev/null)" = "global" ] \
+  || fail "429 не должен понижать мозг"
+
+# И самое главное: в установщике не осталось вопроса про Россию
+# Ищем именно ВОПРОС человеку (read), а не упоминание в комментарии-объяснении
+grep -qE '^[^#]*read .*Вы в России' "$ROOT/install.sh" && fail "вопрос «Вы в России?» вернулся в установщик"
+echo "✓ мозг определяется пробой ключа, вопроса «Вы в России?» в установщике нет"
+
+# Слаги моделей в пробе и в конфиге офиса обязаны совпадать — иначе проверяем
+# одно, а ставим другое
+for m in "google/gemini-2.5-flash" "deepseek/deepseek-v4-flash"; do
+  grep -q "$m" "$ROOT/detect-brain.sh" || fail "модель $m пропала из пробы"
+  grep -q "$m" "$ROOT/install.sh" || fail "модель $m пропала из установщика"
+done
+echo "✓ проба и установка говорят об одних и тех же моделях"
+
 echo
 echo "============================================="
 echo "🎉 Тест старта и сторожа пройден"

@@ -42,25 +42,27 @@ fi
 [ -z "$TELEGRAM_BOT_TOKEN" ] && die "нет токена бота"
 [[ "$OWNER_TG_ID" =~ ^[0-9]+$ ]] || die "id должен быть числом (узнать: @userinfobot)"
 
-# Регион влияет на выбор AI-модели: у российских аккаунтов OpenRouter недоступны Claude/GPT/Gemini
-# (регион-блок с мая 2026), поэтому для России дефолт — DeepSeek (доступен, дёшев, платится рублями).
+# Какой мозг ставить — НЕ спрашиваем человека. Раньше здесь был вопрос «Вы в России?»,
+# и он вводил в заблуждение: доступ к моделям зависит не от места жительства, а от того,
+# отдаёт ли OpenRouter модели этому ключу (у части аккаунтов Claude/GPT/Gemini закрыты
+# по региону аккаунта). Руководитель из Москвы с зарубежным аккаунтом отвечал «да» и
+# получал слабый мозг; с российским аккаунтом отвечал «нет» — и офис вставал на модель,
+# к которой у него доступа нет: установка прошла, а бот молчит.
+# Теперь спрашиваем сам OpenRouter (detect-brain.sh) — как это делает бот-установщик.
+# Заданный в окружении OFFICE_REGION имеет приоритет: его ставит бот, уже сделавший пробу.
 : "${OFFICE_REGION:=}"
 if [ -z "$OFFICE_REGION" ]; then
-  if [ -t 0 ]; then
-    read -rp "  Вы в России? (влияет на выбор AI-модели) [y/N]: " _reg
-    case "$_reg" in [yYдД]*) OFFICE_REGION=ru;; *) OFFICE_REGION=global;; esac
-  else
-    OFFICE_REGION=global
-  fi
+  say "Проверяю, какие модели открыты вашему ключу"
+  OFFICE_REGION="$(bash "$SCRIPT_DIR/detect-brain.sh" "$OPENROUTER_API_KEY")"
 fi
 if [ "$OFFICE_REGION" = "ru" ]; then
   MODEL_PRIMARY="openrouter/deepseek/deepseek-v4-flash"
   MODEL_FALLBACK="openrouter/deepseek/deepseek-v4-pro"
-  ok "регион: Россия — мозг DeepSeek (Claude/GPT/Gemini недоступны рос. аккаунту OpenRouter)"
+  ok "мозг офиса: DeepSeek (быстрый и умный варианты)"
 else
   MODEL_PRIMARY="openrouter/google/gemini-2.5-flash"
   MODEL_FALLBACK="openrouter/anthropic/claude-sonnet-5"
-  ok "регион: обычный — мозг Gemini (эконом) + Claude (умный)"
+  ok "мозг офиса: Gemini на каждый день + Claude на сложное"
 fi
 
 # проверка бота и баланса ДО установки — чтобы не ловить грабли теста
