@@ -35,6 +35,39 @@ log() { printf '[%s] %s\n' "$(date '+%F %T')" "$1" >> "$LOG" 2>/dev/null || true
 # из lib.sh). На живом прогоне 26.07 `journalctl --user` оказался пуст, то есть сторож,
 # смотревший только туда, улик не находил никогда и лечил лишь по «очередь стоит >15 мин».
 
+# Службы НЕТ вообще — самый тяжёлый случай, и до 29.07 сторож его не видел.
+# Первый живой прогон клиентом 29.07: `openclaw daemon install` упал
+# в cloud-init, юнит не создался, служба висела в inactive — не failed. Сторож
+# честно просыпался каждые 2 минуты полчаса подряд и не делал ничего, потому что
+# ниже стоит `is-active || exit 0`, а inactive под это подпадает.
+# Лечим тем же способом, каким ставили: создаём юнит заново и запускаем.
+# Спрашиваем systemd, а не диск: наличие файла — не то же самое, что «служба
+# известна системе», и проверка по файлу давала ложное срабатывание там, где
+# служба на самом деле есть (поймано тестом test-startup.sh сразу после правки).
+if ! systemctl --user cat openclaw-gateway >/dev/null 2>&1; then
+  now=$(date +%s)
+  last_revive=0
+  [ -f "$FAILED_STAMP" ] && last_revive=$(cat "$FAILED_STAMP" 2>/dev/null || echo 0)
+  if [ $((now - last_revive)) -lt "$FAILED_COOLDOWN_SEC" ]; then
+    log "юнита gateway нет, но пересоздавали <${FAILED_COOLDOWN_SEC}с назад — жду"
+    exit 0
+  fi
+  log "юнита openclaw-gateway НЕТ → пересоздаю службу"
+  date +%s > "$FAILED_STAMP" 2>/dev/null || true
+  out="$(openclaw daemon install 2>&1)" || true
+  # Результат проверяем тем же способом, каким искали пропажу — у systemd,
+  # а не по файлу на диске. Разные способы в одной ветке уже дали расхождение.
+  if systemctl --user cat openclaw-gateway >/dev/null 2>&1; then
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user enable --now openclaw-gateway >/dev/null 2>&1 || true
+    sleep 10
+    log "после пересоздания: gateway=$(systemctl --user is-active openclaw-gateway 2>/dev/null || echo unknown)"
+  else
+    log "пересоздать службу не вышло: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')"
+  fi
+  exit 0
+fi
+
 # Служба упала совсем (failed) — поднимаем. Это НЕ случай залипшей очереди: тут
 # лечить нечего, надо просто вернуть офис к жизни. Живой прогон 26.07: гонка
 # «миграция ↔ авто-рестарт» уронила службу в failed, а сторож выходил на первой

@@ -65,6 +65,7 @@ cat > "$WORK/bin/systemctl" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$CALLS"
 case "$*" in
+  *" cat "*) [ -n "${NO_UNIT_FLAG:-}" ] && [ -f "$NO_UNIT_FLAG" ] && exit 1; exit 0 ;;
   *is-active*) echo active ;;
   *NRestarts*) n=$(cat "$RESTARTS_FILE"); echo $((n + 1)) > "$RESTARTS_FILE"; echo "$n" ;;
 esac
@@ -81,6 +82,7 @@ cat > "$WORK/bin/systemctl" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$CALLS"
 case "$*" in
+  *" cat "*) [ -n "${NO_UNIT_FLAG:-}" ] && [ -f "$NO_UNIT_FLAG" ] && exit 1; exit 0 ;;
   *is-active*)  cat "$STATE_FILE" ;;
   *is-failed*)  [ "$(cat "$STATE_FILE")" = "failed" ] && exit 0 || exit 1 ;;
   *NRestarts*)  cat "$RESTARTS_FILE" ;;
@@ -111,6 +113,29 @@ grep -q "reset-failed" "$CALLS" || fail "сторож не снял отметк
 grep -q "start openclaw-gateway" "$CALLS" || fail "сторож не поднял службу"
 grep -q "failed" "$HOME/.openclaw/office-watchdog.log" || fail "сторож не записал случившееся в лог"
 echo "✓ сторож поднимает упавший офис (раньше выходил на первой строке)"
+
+# ─── 5а. Службы НЕТ вообще → сторож пересоздаёт её ─────────────────────────
+# Первый живой прогон клиентом 29.07: `openclaw daemon install` упал в cloud-init,
+# юнита не было, служба висела в inactive — не failed. Сторож просыпался каждые
+# 2 минуты полчаса и не делал ничего. Проверяем, что теперь делает.
+reset_stub
+rm -f "$HOME/.openclaw/.watchdog-last-revive"          # антипетля не должна мешать сценарию
+NO_UNIT_FLAG="$WORK/no_unit"; : > "$NO_UNIT_FLAG"      # заглушка: systemd не знает службу
+export NO_UNIT_FLAG
+cat > "$WORK/bin/openclaw" <<'STUB'
+#!/usr/bin/env bash
+echo "openclaw $*" >> "$CALLS"
+# «Создали юнит» — снимаем флаг, дальше systemctl cat отвечает успехом
+[ "$1 $2" = "daemon install" ] && rm -f "$NO_UNIT_FLAG"
+exit 0
+STUB
+chmod +x "$WORK/bin/openclaw"
+bash "$ROOT/watchdog.sh" >/dev/null 2>&1
+grep -q "openclaw daemon install" "$CALLS" || fail "сторож не попытался пересоздать отсутствующую службу"
+grep -q "enable --now openclaw-gateway" "$CALLS" || fail "сторож не включил пересозданную службу"
+grep -q "юнита openclaw-gateway НЕТ" "$HOME/.openclaw/office-watchdog.log" || fail "сторож не записал, что юнита не было"
+rm -f "$WORK/bin/openclaw"
+echo "✓ сторож пересоздаёт службу, которой нет вовсе (находка прогона 29.07)"
 
 # ─── 6. Антипетля: сразу второй раз не дёргаем ─────────────────────────────
 : > "$CALLS"; echo failed > "$STATE_FILE"
@@ -168,6 +193,7 @@ cat > "$WORK/bin/systemctl" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$CALLS"
 case "$*" in
+  *" cat "*) [ -n "${NO_UNIT_FLAG:-}" ] && [ -f "$NO_UNIT_FLAG" ] && exit 1; exit 0 ;;
   *is-active*)  cat "$STATE_FILE" ;;
   *NRestarts*)  echo 0 ;;
   *daemon-reload*) : ;;
@@ -202,6 +228,7 @@ cat > "$WORK/bin/systemctl" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$CALLS"
 case "$*" in
+  *" cat "*) [ -n "${NO_UNIT_FLAG:-}" ] && [ -f "$NO_UNIT_FLAG" ] && exit 1; exit 0 ;;
   *is-active*) echo activating ;;
   *NRestarts*) echo 0 ;;
 esac
@@ -235,6 +262,7 @@ cat > "$WORK/bin/systemctl" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$CALLS"
 case "$*" in
+  *" cat "*) [ -n "${NO_UNIT_FLAG:-}" ] && [ -f "$NO_UNIT_FLAG" ] && exit 1; exit 0 ;;
   *is-active*) cat "$STATE_FILE" ;;
   *NRestarts*) echo 0 ;;
   *start*)
