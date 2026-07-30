@@ -395,51 +395,64 @@ echo "✓ проба и установка говорят об одних и т�
 # Замер на живом офисе 29.07: 25k из 48k заняты в обычной переписке, больше
 # половины окна съедали инструкции. Клиент видел, что офис забывает начало
 # разговора. Стережём, чтобы значение не уехало обратно молча.
-CTX=$(grep -oE '"contextTokens": *[0-9]+' "$ROOT/install.sh" | grep -oE '[0-9]+')
+CTX=$(grep -oE '"contextTokens": *[0-9]+' "$ROOT/apply-settings.sh" | grep -oE '[0-9]+' | head -1)
 [ -n "$CTX" ] || fail "contextTokens пропал из конфига офиса"
 [ "$CTX" -ge 100000 ] || fail "стол офиса ужался до $CTX — клиент снова начнёт терять начало разговора"
 echo "✓ офис держит разговор: contextTokens = $CTX"
 
 # Модель для документов. Без неё чтение PDF падает с «No PDF model configured» —
 # поймано 30.07 на живом офисе, клиент прислал документ и не получил разбора.
-grep -q 'pdfModel' "$ROOT/install.sh" || fail "pdfModel пропал — офис снова не сможет читать документы"
+grep -q 'pdfModel' "$ROOT/apply-settings.sh" || fail "pdfModel пропал — офис снова не сможет читать документы"
 # На пути DeepSeek модель документов НЕ ставится: он принимает только текст,
 # и заглушка там означала бы обещание, которого офис не выполнит.
-grep -q 'PDF_MODEL_JSON=""' "$ROOT/install.sh" \
+grep -q 'DOCS_OK=0' "$ROOT/apply-settings.sh" \
   || fail "на пути DeepSeek модель документов должна оставаться пустой"
 echo "✓ документы: модель задана там, где их умеют читать, и не обещана там, где нет"
 
 # Активная память включается явно: в движке она выключена по умолчанию
 # («bundled (disabled by default)» — проверено 30.07 через openclaw plugins inspect).
-grep -q "plugins enable active-memory" "$ROOT/install.sh" \
+grep -q "plugins enable active-memory" "$ROOT/apply-settings.sh" \
   || fail "включение активной памяти пропало — офис перестанет вспоминать сам"
 # И не должна валить установку: офис без неё работает, просто помнит хуже
-grep -q "plugins enable active-memory .*||" "$ROOT/install.sh" \
-  || grep -A2 "plugins enable active-memory" "$ROOT/install.sh" | grep -q "else" \
+grep -A2 "plugins enable active-memory" "$ROOT/apply-settings.sh" | grep -q "else" \
   || fail "сбой включения активной памяти обязан быть мягким, а не ронять установку"
 echo "✓ активная память включается явно и не роняет установку при сбое"
 
-# ─── 11. Четыре уровня мозга ────────────────────────────────────────────────
-# Клиент говорит уровнями, а не именами моделей. Псевдонимы движок принимает только
-# латиницей — кириллица отвергается («Alias must use letters, numbers, dots,
-# underscores, colons, or dashes», проверено 30.07 на живом офисе).
+# ─── 11. Настройки доезжают и до тех, у кого офис уже стоит ────────────────
+# До 30.07 конфиг применялся только установщиком, а обновлялка его не трогала —
+# улучшения не доходили до существующих клиентов никогда (находка аудита).
+[ -s "$ROOT/apply-settings.sh" ] || fail "apply-settings.sh пропал — настройки некому применять"
+grep -q "apply-settings.sh" "$ROOT/install.sh" || fail "установщик не зовёт apply-settings.sh"
+grep -q "apply-settings.sh" "$ROOT/update.sh"  || fail "обновлялка не зовёт apply-settings.sh — настройки не доедут до клиента"
+grep -q "settings-changed" "$ROOT/update.sh"   || fail "обновлялка не видит признак изменений — офис не перезапустится"
+grep -q "settings-changed" "$ROOT/apply-settings.sh" || fail "apply-settings.sh не сообщает об изменениях"
+echo "✓ настройки применяются одним скриптом: и при установке, и при обновлении"
+
+# Настройки не должны остаться и в установщике — иначе два источника правды разъедутся
+grep -q "contextTokens" "$ROOT/install.sh" && fail "contextTokens остался в установщике: два источника правды"
+grep -q "aliases add" "$ROOT/install.sh" && fail "псевдонимы остались в установщике: два источника правды"
+echo "✓ у настроек один источник правды"
+
+# Четыре уровня мозга. Псевдонимы движок принимает только латиницей — кириллица
+# отвергается («Alias must use letters, numbers, dots, underscores, colons, or dashes»).
 for a in lite fast smart max; do
-  grep -q "\"$a:\$ALIAS_" "$ROOT/install.sh" || fail "уровень мозга $a пропал из установщика"
+  grep -q "\"$a:\$A_" "$ROOT/apply-settings.sh" || fail "уровень мозга $a пропал"
 done
-grep -q "models aliases add" "$ROOT/install.sh" || fail "псевдонимы уровней больше не заводятся"
-# Кириллица в именах псевдонимов = молчаливо неработающие команды у клиента
-grep -E "aliases add \"?[а-яё]" "$ROOT/install.sh" && fail "псевдоним кириллицей — движок его не примет"
+grep -E "aliases add \"?[а-яё]" "$ROOT/apply-settings.sh" && fail "псевдоним кириллицей — движок его не примет"
 echo "✓ четыре уровня мозга заводятся латиницей: lite | fast | smart | max"
 
-# Уровни должны быть объяснены клиенту по-русски в обоих местах, где он их встретит
-for f in "$ROOT/workspace/AGENTS.md" "$ROOT/guides/09-first-week.md"; do
-  for a in lite fast smart max; do
-    grep -q "/model $a" "$f" || fail "уровень $a не объяснён в $(basename "$f")"
-  done
-done
-# И правило возврата: на верхних уровнях не сидят постоянно
+# Правда об уровнях — в BRAIN.md, у каждого клиента своя. Статическая таблица
+# в AGENTS.md обещала «самый умный» тем, у кого уровней два (находка аудита).
+grep -q "BRAIN.md" "$ROOT/apply-settings.sh" || fail "BRAIN.md не создаётся"
+grep -q "BRAIN.md" "$ROOT/workspace/AGENTS.md" || fail "офис не знает про BRAIN.md — не прочитает уровни"
+grep -qE "^\| .model (lite|max)." "$ROOT/workspace/AGENTS.md" && fail "статическая таблица уровней вернулась в AGENTS.md"
+# office-sync не должен перезаписывать BRAIN.md — иначе правда о клиенте затрётся общей
+grep -q "BRAIN" "$ROOT/office-sync.sh" && fail "office-sync трогает BRAIN.md — правда о клиенте затрётся"
+echo "✓ уровни описаны в BRAIN.md под конкретного клиента, а не обещаны всем одинаково"
+
+# Возврат на обычный уровень: на верхних не сидят постоянно
 grep -qi "верн" "$ROOT/workspace/AGENTS.md" || fail "офис не возвращает владельца на обычный уровень"
-echo "✓ уровни объяснены по-русски и офис возвращает владельца на обычный"
+echo "✓ офис возвращает владельца на обычный уровень"
 
 # Поведение при собственной поломке: руководителю — одно действие, а не диагностика.
 # Первый живой клиент получил дословно «проверьте логи OpenClaw Gateway».
