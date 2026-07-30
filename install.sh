@@ -66,15 +66,44 @@ fi
 #   deepseek-v4-*     — только text
 # Поэтому на пути DeepSeek читать документы нечем: модель их физически не принимает.
 # Ставить туда заглушку нельзя — офис должен честно сказать, что не умеет, а не падать.
+#
+# Четыре уровня мозга. Клиент не должен помнить имена моделей: он говорит уровнями,
+# а какая модель за уровнем стоит — наше дело, и мы вправе её менять.
+# Псевдонимы движок принимает ТОЛЬКО латиницей («Alias must use letters, numbers,
+# dots, underscores, colons, or dashes» — проверено 30.07), поэтому команды
+# латинские, а объяснение уровней — по-русски, в витрине и в AGENTS.md.
+#
+# Цены за 1 млн токенов вход/выход (openrouter.ai/api/v1/models, 30.07):
+#   lite  gemini-2.5-flash-lite  $0.10 / $0.40   ~$2/мес
+#   fast  gemini-2.5-flash       $0.30 / $2.50   ~$8/мес   ← по умолчанию
+#   smart claude-sonnet-5        $2.00 / $10.00  ~$45/мес
+#   max   claude-opus-5          $5.00 / $25.00  ~$112/мес
+# (оценка «в месяц» — 30 реплик в день при полном столе, то есть верхняя граница)
+#
+# Почему по умолчанию не самый дешёвый: flash-lite втрое дешевле, но дефолт обязан
+# читать документы и слушать голос без оговорок. Экономия на дефолте обернулась бы
+# вопросом «почему он не открыл мой PDF».
 if [ "$OFFICE_REGION" = "ru" ]; then
   MODEL_PRIMARY="openrouter/deepseek/deepseek-v4-flash"
   MODEL_FALLBACK="openrouter/deepseek/deepseek-v4-pro"
   PDF_MODEL_JSON=""
+  # У аккаунта открыт только DeepSeek: настоящих четырёх уровней нет, есть два.
+  # Верхние псевдонимы ведут на тот же pro — обещать несуществующий «самый умный»
+  # нельзя, но и оставлять команду мёртвой тоже: человек напишет /model max.
+  ALIAS_LITE="openrouter/deepseek/deepseek-v4-flash"
+  ALIAS_FAST="openrouter/deepseek/deepseek-v4-flash"
+  ALIAS_SMART="openrouter/deepseek/deepseek-v4-pro"
+  ALIAS_MAX="openrouter/deepseek/deepseek-v4-pro"
   ok "мозг офиса: DeepSeek (быстрый и умный варианты)"
   warn "чтение PDF и картинок недоступно: DeepSeek принимает только текст"
+  warn "уровней мозга два, а не четыре: сильнее pro вашему аккаунту не открыто"
 else
   MODEL_PRIMARY="openrouter/google/gemini-2.5-flash"
   MODEL_FALLBACK="openrouter/anthropic/claude-sonnet-5"
+  ALIAS_LITE="openrouter/google/gemini-2.5-flash-lite"
+  ALIAS_FAST="openrouter/google/gemini-2.5-flash"
+  ALIAS_SMART="openrouter/anthropic/claude-sonnet-5"
+  ALIAS_MAX="openrouter/anthropic/claude-opus-5"
   PDF_MODEL_JSON="\"pdfModel\": { \"primary\": \"${MODEL_PRIMARY}\", \"fallbacks\": [\"${MODEL_FALLBACK}\"] },
     \"imageModel\": { \"primary\": \"${MODEL_PRIMARY}\", \"fallbacks\": [\"${MODEL_FALLBACK}\"] },"
   ok "мозг офиса: Gemini на каждый день + Claude на сложное"
@@ -241,6 +270,20 @@ if openclaw plugins enable active-memory >/dev/null 2>&1; then
   ok "активная память включена — офис вспоминает сам"
 else
   warn "активную память включить не удалось — офис будет помнить только то, что перечитает сам"
+fi
+
+# Уровни мозга под короткими именами: /model lite | fast | smart | max.
+# Без них человеку пришлось бы писать /model openrouter/anthropic/claude-opus-5 —
+# ровно тот технический язык, который SOUL.md запрещает показывать клиенту.
+ALIAS_OK=0
+for pair in "lite:$ALIAS_LITE" "fast:$ALIAS_FAST" "smart:$ALIAS_SMART" "max:$ALIAS_MAX"; do
+  name="${pair%%:*}"; target="${pair#*:}"
+  openclaw models aliases add "$name" "$target" >/dev/null 2>&1 && ALIAS_OK=$((ALIAS_OK+1))
+done
+if [ "$ALIAS_OK" -eq 4 ]; then
+  ok "уровни мозга готовы: /model lite | fast | smart | max"
+else
+  warn "уровни мозга встали не полностью ($ALIAS_OK из 4) — выбор моделей остаётся полным именем"
 fi
 
 # --- 5. Безопасность: файрвол (наружу только SSH) ---------------------------
