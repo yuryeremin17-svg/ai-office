@@ -55,13 +55,28 @@ if [ -z "$OFFICE_REGION" ]; then
   say "Проверяю, какие модели открыты вашему ключу"
   OFFICE_REGION="$(bash "$SCRIPT_DIR/detect-brain.sh" "$OPENROUTER_API_KEY")"
 fi
+# Модель для документов и картинок задаётся ОТДЕЛЬНО от разговорной. Без неё
+# инструмент чтения PDF падает с «No PDF model configured» — поймано 30.07 на живом
+# офисе: клиент прислал PDF, инструмент отказал (лог движка, tool_action failed).
+# Руководитель присылает документы постоянно, так что это не мелочь.
+#
+# Кто что принимает на вход (проверено 30.07 у openrouter.ai/api/v1/models):
+#   gemini-2.5-flash  — text, image, file, audio, video
+#   claude-sonnet-5   — text, image, file
+#   deepseek-v4-*     — только text
+# Поэтому на пути DeepSeek читать документы нечем: модель их физически не принимает.
+# Ставить туда заглушку нельзя — офис должен честно сказать, что не умеет, а не падать.
 if [ "$OFFICE_REGION" = "ru" ]; then
   MODEL_PRIMARY="openrouter/deepseek/deepseek-v4-flash"
   MODEL_FALLBACK="openrouter/deepseek/deepseek-v4-pro"
+  PDF_MODEL_JSON=""
   ok "мозг офиса: DeepSeek (быстрый и умный варианты)"
+  warn "чтение PDF и картинок недоступно: DeepSeek принимает только текст"
 else
   MODEL_PRIMARY="openrouter/google/gemini-2.5-flash"
   MODEL_FALLBACK="openrouter/anthropic/claude-sonnet-5"
+  PDF_MODEL_JSON="\"pdfModel\": { \"primary\": \"${MODEL_PRIMARY}\", \"fallbacks\": [\"${MODEL_FALLBACK}\"] },
+    \"imageModel\": { \"primary\": \"${MODEL_PRIMARY}\", \"fallbacks\": [\"${MODEL_FALLBACK}\"] },"
   ok "мозг офиса: Gemini на каждый день + Claude на сложное"
 fi
 
@@ -167,6 +182,7 @@ cat > "$PATCH" <<JSON
     "workspace": "${OFFICE_DIR}",
     "model": { "primary": "${MODEL_PRIMARY}",
                "fallbacks": ["${MODEL_FALLBACK}"] },
+    ${PDF_MODEL_JSON}
     "thinkingDefault": "off",
     "maxConcurrent": 1,
     "contextTokens": 200000,
@@ -207,6 +223,25 @@ JSON
 openclaw config patch --file "$PATCH" >/dev/null
 rm -f "$PATCH"
 openclaw config validate >/dev/null && ok "конфиг применён и валиден"
+
+# Активная память: офис сам вспоминает нужное перед ответом, а не только когда
+# владелец попросит. Без неё записи в MEMORY.md лежат мёртвым грузом — офис
+# заглядывает в файл, лишь если догадается, а обычно не догадывается.
+#
+# Замер на живом офисе 30.07: хронику дня офис вёл сам (memory/2026-07-30.md),
+# а MEMORY.md за всё время остался нетронутым шаблоном.
+#
+# Чего это стоит: перед ответом идёт короткий отдельный запрос к модели. На дешёвом
+# мозге это доли цента за реплику. Плагин ограничен изнутри: объём выжимки урезан,
+# после трёх подряд неудач вспоминание отключается на минуту и ответ уходит без него —
+# то есть сломаться в «офис молчит» это не может.
+#
+# Не критично для установки: не включилось — офис работает, просто хуже помнит.
+if openclaw plugins enable active-memory >/dev/null 2>&1; then
+  ok "активная память включена — офис вспоминает сам"
+else
+  warn "активную память включить не удалось — офис будет помнить только то, что перечитает сам"
+fi
 
 # --- 5. Безопасность: файрвол (наружу только SSH) ---------------------------
 say "Шаг 5/9 — файрвол (наружу только SSH, шлюз остаётся loopback)"
