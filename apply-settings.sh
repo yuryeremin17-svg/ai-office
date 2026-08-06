@@ -186,5 +186,115 @@ else
 fi
 rm -f "$BRAIN_TMP"
 
+# --- 5. Расписание обновлений: ежедневно вместо раз в неделю ----------------
+# Расписание задаётся в install.sh и потому применялось только при установке:
+# у клиентов, поставленных раньше, так и остаётся «понедельник 04:00». Правка
+# в установщике до них не доедет никогда — тот же класс дефекта, ради которого
+# заведён этот файл. Поэтому расписание чиним здесь.
+#
+# Зачем ежедневно: недельный цикл означал, что доработка, выпущенная во вторник,
+# приезжает клиенту только в понедельник. Обновлялка и так тихо выходит, когда
+# нового нет, — частота ничего не стоит.
+#
+# Время оставлено ночным, разброс получаса сохранён: когда клиентов станет
+# много, они не постучатся в GitHub одной секундой.
+#
+# Почему целиком в функции с перехватом ошибки. Файл идёт под `set -e`, а этот
+# блок ПОСЛЕДНИЙ — падение здесь оборвало бы скрипт до строки `settings-changed`,
+# и обновлялка решила бы, что менять нечего: конфиг применён, а офис не
+# перезапущен, и тревога никому не уходит (update.sh в ветке ошибки только пишет
+# в лог). Расписание — не та вещь, ради которой можно потерять всё обновление.
+schedule_daily() {
+  local timer="$HOME/.config/systemd/user/office-update.timer"
+  local service="$HOME/.config/systemd/user/office-update.service"
+  local want_cal="OnCalendar=*-*-* 04:00:00"
+
+  command -v systemctl >/dev/null 2>&1 || return 0   # не systemd (прогон на Маке) — не наша забота
+
+  # На свежей установке apply-settings зовётся на шаге 4, а таймер появляется на
+  # шаге 8 — его отсутствие здесь нормально, это не «чужая сборка».
+  [ -f "$timer" ] || { ok "таймера ещё нет — его поставит установщик"; return 0; }
+
+  local need=0
+  grep -qxF "$want_cal" "$timer" || need=1
+  # Описание службы правится здесь же: оно живёт в install.sh и до существующих
+  # клиентов иначе не доедет — у них `systemctl status` врал бы «Weekly».
+  [ -f "$service" ] && ! grep -q '^Description=Daily' "$service" && need=1
+  [ "$need" = "0" ] && { ok "обновления уже ежедневные"; return 0; }
+
+  # Мусор от прерванных прогонов: временный файл лежит в каталоге systemd, и без
+  # уборки он копился бы там вечно. Чистим свои и чужие остатки до записи.
+  rm -f "$timer".new.* 2>/dev/null || true
+
+  # Копия прежнего юнита — вне каталога systemd: там ей не место, systemd читает
+  # весь каталог. Копия одна и перезаписывается: история версий тут не нужна.
+  # Честно: это откат на одну ночь. Пока правка живёт в сборке, ближайшее
+  # обновление вернёт ежедневное расписание. Настоящий откат — откатить сборку.
+  local bakdir="$HOME/.openclaw"
+  mkdir -p "$bakdir" 2>/dev/null || true
+  cp -f "$timer" "$bakdir/office-update.timer.before-daily" 2>/dev/null || true
+
+  # Пишем через временный файл и переносим одним движением: обрыв на середине
+  # оставил бы обрезанный юнит, systemd его не загрузит, и офис не обновится
+  # больше НИКОГДА — молча. Перенос атомарен, битого состояния не бывает.
+  # Расписание в юните собирается из той же переменной, по которой проверяли
+  # выше. Двумя отдельными местами они разъезжались бы молча: проверка искала
+  # бы одно, юнит нёс другое, need оставался бы 1 навсегда — и офис клиента
+  # перезапускался бы КАЖДУЮ ночь без причины. Тесты такого не ловят.
+  local tmp="$timer.new.$$"
+  cat > "$tmp" <<UNIT
+[Unit]
+Description=Run office self-update daily (04:00)
+[Timer]
+${want_cal}
+Persistent=true
+RandomizedDelaySec=1800
+[Install]
+WantedBy=timers.target
+UNIT
+  mv -f "$tmp" "$timer" || { rm -f "$tmp"; warn "расписание записать не удалось — осталось прежнее"; return 0; }
+
+  # Описание службы — через временный файл, а не `sed -i`: у GNU и BSD разный
+  # синтаксис ключа (BSD требует аргумент суффикса), и на одной из систем правка
+  # молча не применялась бы. Заодно запись остаётся атомарной, как у таймера.
+  if [ -f "$service" ] && grep -q '^Description=Weekly ' "$service"; then
+    local stmp="$service.new.$$"
+    if sed 's/^Description=Weekly /Description=Daily /' "$service" > "$stmp" 2>/dev/null; then
+      mv -f "$stmp" "$service" || rm -f "$stmp"
+    else
+      rm -f "$stmp"
+    fi
+  fi
+
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  systemctl --user restart office-update.timer >/dev/null 2>&1 || true
+
+  # «Перезапустили» и «работает» — разные вещи. Спрашиваем systemd, а не себя.
+  if systemctl --user is-active --quiet office-update.timer 2>/dev/null; then
+    mark; ok "обновления переведены на ежедневные (было: раз в неделю)"
+    return 0
+  fi
+
+  # Таймер не поднялся — возвращаем прежний юнит. Лучше редкие обновления,
+  # чем никаких: без живого таймера офис замолкает навсегда и незаметно.
+  # Юнит мог остаться в failed — снимаем отметку, иначе start не сработает.
+  if [ -f "$bakdir/office-update.timer.before-daily" ]; then
+    cp -f "$bakdir/office-update.timer.before-daily" "$timer" 2>/dev/null || true
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user reset-failed office-update.timer >/dev/null 2>&1 || true
+    systemctl --user start office-update.timer >/dev/null 2>&1 || true
+  fi
+
+  # Проверяем и откат тоже. Рапортовать «вернул прежнее», не убедившись, —
+  # ровно тот грех, ради которого выше добавлена проверка живости.
+  if systemctl --user is-active --quiet office-update.timer 2>/dev/null; then
+    warn "TREVOGA-UPDATES: новое расписание systemd не принял, вернул прежнее — сообщите нам"
+  else
+    warn "TREVOGA-UPDATES: таймер обновлений не работает — офис больше не обновляется сам, срочно сообщите нам"
+  fi
+  return 0
+}
+schedule_daily || warn "расписание обновлений не тронуто из-за сбоя — офис работает на прежнем"
+
 [ "$CHANGED" = "1" ] && echo "settings-changed"
 exit 0

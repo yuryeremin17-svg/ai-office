@@ -15,6 +15,11 @@ set -euo pipefail
 
 say() { printf "\n\033[1;33m▸ %s\033[0m\n" "$1"; }
 ok()  { printf "\033[0;32m  ✓ %s\033[0m\n" "$1"; }
+# warn вызывался трижды (ветка DeepSeek на шаге 1 и сбой настроек на шаге 4),
+# но определён не был ни здесь, ни в lib.sh. Файл идёт под `set -e`, поэтому
+# «command not found» обрывал установку: клиент с ключом, которому OpenRouter
+# отдаёт только DeepSeek, не мог поставить офис вообще — падало на шаге 1 из 9.
+warn(){ printf "\033[0;33m  ⚠ %s\033[0m\n" "$1"; }
 die() { printf "\n\033[0;31m✗ %s\033[0m\n" "$1"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # наша сборка (git-репо, останется для обновлений)
@@ -80,7 +85,12 @@ GETME=$(curl -s -m 15 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 
 echo "$GETME" | grep -q '"ok":true' || die "токен бота невалиден (Telegram отклонил запрос)"
 BOT_USER=$(echo "$GETME" | grep -o '"username":"[^"]*"' | sed 's/.*:"//;s/"$//')
 ok "бот: @${BOT_USER}"
-KEYINFO=$(curl -s "https://openrouter.ai/api/v1/key" -H "Authorization: Bearer ${OPENROUTER_API_KEY}")
+# Таймаут и перехват — как у проверки Telegram строкой выше. Без них моргание
+# сети обрывало установку с голым кодом ошибки: файл под `set -e`, а неудачный
+# curl возвращает ненулевой код. Баланс — справочная величина, ради неё терять
+# установку нельзя: не узнали — идём дальше молча.
+KEYINFO=$(curl -s -m 15 "https://openrouter.ai/api/v1/key" -H "Authorization: Bearer ${OPENROUTER_API_KEY}" || echo '')
+[ -z "$KEYINFO" ] && warn "баланс OpenRouter проверить не удалось (сеть) — установка продолжается"
 echo "$KEYINFO" | grep -o '"is_free_tier":[a-z]*' | grep -q true && printf "\033[0;31m  ⚠ OpenRouter на free-tier — платные модели не работают, пополните баланс!\033[0m\n"
 # Остаток баланса: если задан лимит и осталось мало — предупредить (иначе бот замолчит через день-два)
 REMAIN=$(echo "$KEYINFO" | python3 -c "import sys,json;d=json.load(sys.stdin).get('data',{});r=d.get('limit_remaining');print(r if r is not None else '')" 2>/dev/null || echo '')
@@ -90,7 +100,7 @@ fi
 
 # --- 2. Установка OpenClaw ---------------------------------------------------
 say "Шаг 2/9 — установка OpenClaw"
-# git нужен обновлялке (update.sh git pull раз в неделю). На голом сервере/из
+# git нужен обновлялке (update.sh git pull ежедневно). На голом сервере/из
 # cloud-init его может не быть — доставляем заранее, тихо.
 apt_wait 300 || printf "  (apt занят автообновлениями дольше обычного — продолжаю)\n"
 command -v git >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git >/dev/null 2>&1 || true; }
@@ -345,7 +355,7 @@ else
   printf "\033[0;31m  ⚠ служба не вышла в рабочий режим за 12 минут — проверка на Шаге 9 покажет подробности\033[0m\n"
 fi
 
-# --- 8. Автообновление (будильник раз в неделю) -----------------------------
+# --- 8. Автообновление (будильник ежедневно) --------------------------------
 say "Шаг 8/9 — автообновление офиса"
 # Окружение для обновлялки: где рабочая папка и куда слать пульс (пока выключен).
 # HEARTBEAT_URL берём из окружения (cloud-init задаёт наш датчик пульса).
@@ -358,11 +368,11 @@ OWNER_TG_ID="${OWNER_TG_ID}"
 HEARTBEAT_URL="${HEARTBEAT_URL}"
 ENV
 chmod 600 "$HOME/.openclaw/.office-env"
-# Будильник: раз в неделю ночью зовёт update.sh из нашей сборки.
+# Будильник: каждую ночь зовёт update.sh из нашей сборки.
 # update.sh сам решает, есть ли что обновлять, и трогает офис только если да.
 cat > "$HOME/.config/systemd/user/office-update.service" <<UNIT
 [Unit]
-Description=Weekly OpenClaw office self-update (engine + our skills, keeps client data)
+Description=Daily OpenClaw office self-update (engine + our skills, keeps client data)
 [Service]
 Type=oneshot
 ExecStart=${SCRIPT_DIR}/update.sh
@@ -370,9 +380,9 @@ TimeoutStartSec=600
 UNIT
 cat > "$HOME/.config/systemd/user/office-update.timer" <<'UNIT'
 [Unit]
-Description=Run office self-update weekly (Mon 04:00)
+Description=Run office self-update daily (04:00)
 [Timer]
-OnCalendar=Mon *-*-* 04:00:00
+OnCalendar=*-*-* 04:00:00
 Persistent=true
 RandomizedDelaySec=1800
 [Install]
@@ -421,7 +431,7 @@ systemctl --user daemon-reload >/dev/null 2>&1 || true
 systemctl --user enable --now office-update.timer >/dev/null 2>&1 || true
 systemctl --user enable --now office-heartbeat.timer >/dev/null 2>&1 || true
 systemctl --user enable --now office-watchdog.timer >/dev/null 2>&1 || true
-ok "будильник (обновление раз в неделю), пульс (15 мин) и сторож (2 мин) поставлены"
+ok "будильник (обновление каждую ночь), пульс (15 мин) и сторож (2 мин) поставлены"
 
 # --- 9. Проверка -------------------------------------------------------------
 say "Шаг 9/9 — проверка"

@@ -165,7 +165,7 @@ chmod +x "$WORK/bin/openclaw"
 # shellcheck source=../lib.sh
 . "$ROOT/lib.sh"
 got=$(engine_version)
-[ "$got" = "2026.7.1-2" ] || fail "версия движка прочитана как «$got» вместо «2026.7.1-2»"
+[ "$got" = "2026.7.1-2" ] || fail "версия движка прочитана как «${got}» вместо «2026.7.1-2»"
 # и версия без суффикса тоже должна читаться
 printf '#!/usr/bin/env bash\n[ "$1" = "--version" ] && echo "OpenClaw 2026.6.11 (abc)"\nexit 0\n' > "$WORK/bin/openclaw"
 chmod +x "$WORK/bin/openclaw"
@@ -471,6 +471,116 @@ grep -q "Enable auto top up" "$ROOT/guides/09-first-week.md" \
 grep -q "Credit limit" "$ROOT/guides/09-first-week.md" \
   || fail "в гайде пропал лимит на ключ — главная защита клиента от переплаты"
 echo "✓ гайд первой недели на месте: команды, автопополнение, лимит ключа"
+
+# ─── 12. Расписание обновлений: ежедневное и доезжает до старых клиентов ────
+# Расписание жило только в install.sh, то есть применялось при установке и
+# больше никогда. У клиента, поставленного раньше, оставалось «понедельник
+# 04:00»: доработка вторника приезжала к нему через шесть дней.
+grep -q 'OnCalendar=\*-\*-\* 04:00:00' "$ROOT/install.sh" \
+  || fail "в установщике не ежедневное расписание — новые клиенты будут ждать неделю"
+grep -q 'OnCalendar=\*-\*-\* 04:00:00' "$ROOT/apply-settings.sh" \
+  || fail "apply-settings не чинит расписание — до существующих клиентов ежедневное не доедет"
+grep -qE 'OnCalendar=(Mon|Tue|Wed|Thu|Fri|Sat|Sun)' "$ROOT/install.sh" "$ROOT/apply-settings.sh" \
+  && fail "вернулось недельное расписание"
+echo "✓ обновления ежедневные и доезжают до тех, у кого офис уже стоит"
+
+# Дальше — не поиск текста в исходнике, а прогон настоящего apply-settings.sh
+# с подставными systemctl и openclaw. Grep по коду ловит только формулировку:
+# первая версия этой секции пропускала регресс, при котором проверка искала одно
+# расписание, а юнит нёс другое — офис клиента перезапускался бы КАЖДУЮ ночь,
+# а тест рапортовал бы об успехе. Проверяем поведение.
+SB="$WORK/sched"; mkdir -p "$SB/home/.config/systemd/user" "$SB/home/.openclaw" "$SB/bin" "$SB/office"
+SCHED_CALLS="$SB/calls"; SCHED_ACTIVE="$SB/active"; export SCHED_CALLS SCHED_ACTIVE
+echo 0 > "$SCHED_ACTIVE"        # 0 = таймер поднимается, 3 = не поднимается
+cat > "$SB/bin/systemctl" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$SCHED_CALLS"
+case "$*" in *is-active*) exit "$(cat "$SCHED_ACTIVE")" ;; esac
+exit 0
+STUB
+# Движок отвечает так, чтобы блоки 1-4 отработали вхолостую и не мешали.
+cat > "$SB/bin/openclaw" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  "config get agents.defaults.model.primary") echo "openrouter/google/gemini-2.5-flash" ;;
+  "config get agents.defaults.contextTokens") echo "200000" ;;
+  *"plugins list"*) echo "active-memory enabled" ;;
+  *"aliases list"*) echo "- lite -> openrouter/google/gemini-2.5-flash" ;;
+esac
+exit 0
+STUB
+chmod +x "$SB/bin/systemctl" "$SB/bin/openclaw"
+
+run_sched() {   # прогон apply-settings в песочнице; печатает вывод
+  ( export HOME="$SB/home" PATH="$SB/bin:$PATH" OFFICE_DIR="$SB/office"
+    : > "$SCHED_CALLS"
+    bash "$ROOT/apply-settings.sh" global 2>&1 )
+}
+TIMER_F="$SB/home/.config/systemd/user/office-update.timer"
+SERVICE_F="$SB/home/.config/systemd/user/office-update.service"
+week_timer() { printf '[Unit]\nDescription=Run office self-update weekly (Mon 04:00)\n[Timer]\nOnCalendar=Mon *-*-* 04:00:00\nPersistent=true\n[Install]\nWantedBy=timers.target\n' > "$TIMER_F"
+               printf '[Unit]\nDescription=Weekly OpenClaw office self-update\n[Service]\nType=oneshot\n' > "$SERVICE_F"; }
+
+# А. Свежая установка: таймера ещё нет (его создаст шаг 8) — не пугать оператора
+rm -f "$TIMER_F" "$SERVICE_F"
+OUT_A="$(run_sched)"
+printf '%s' "$OUT_A" | grep -q "не нашей сборкой" && fail "на свежей установке пугаем оператора чужой сборкой"
+printf '%s' "$OUT_A" | grep -q "settings-changed" || fail "на свежей установке потерян сигнал об изменениях"
+echo "✓ свежая установка: отсутствие таймера не выдаётся за поломку"
+
+# Б. Существующий клиент: недельное расписание переезжает на ежедневное
+week_timer
+OUT_B="$(run_sched)"
+grep -qxF 'OnCalendar=*-*-* 04:00:00' "$TIMER_F" \
+  || fail "расписание не переехало на ежедневное — клиент так и ждёт понедельника"
+grep -q '^Description=Daily' "$SERVICE_F" \
+  || fail "описание службы осталось недельным — systemctl status будет врать клиенту"
+printf '%s' "$OUT_B" | grep -q "settings-changed" || fail "переезд расписания не помечен как изменение"
+echo "✓ существующий клиент переезжает на ежедневные обновления"
+
+# В. Идемпотентность: второй прогон не трогает ничего и НЕ просит перезапуск.
+# Иначе офис клиента перезапускался бы каждую ночь без причины.
+OUT_C="$(run_sched)"
+printf '%s' "$OUT_C" | grep -q "уже ежедневные" || fail "повторный прогон не распознал, что расписание уже ежедневное"
+grep -q "restart office-update.timer" "$SCHED_CALLS" && fail "повторный прогон дёргает таймер — офис будет перезапускаться каждую ночь"
+echo "✓ повторные прогоны ничего не трогают (ночных перезапусков не будет)"
+
+# Г. Таймер не поднялся: возвращаем прежний юнит и бьём тревогу, которую видно.
+# Молчаливый отказ здесь означает, что офис перестанет обновляться навсегда.
+week_timer; echo 3 > "$SCHED_ACTIVE"
+OUT_D="$(run_sched)"
+printf '%s' "$OUT_D" | grep -q "TREVOGA-UPDATES" \
+  || fail "таймер не поднялся, а тревоги нет — обновления умрут молча"
+grep -qxF 'OnCalendar=Mon *-*-* 04:00:00' "$TIMER_F" \
+  || fail "после неудачи не вернули прежний рабочий юнит"
+printf '%s' "$OUT_D" | grep -q "settings-changed" || fail "неудача расписания погасила сигнал об остальных настройках"
+echo 0 > "$SCHED_ACTIVE"
+echo "✓ неудача отката видна человеку, прежний таймер возвращён"
+
+# Д. Тревога из настроек доходит до владельца, а не оседает в логе
+grep -q "TREVOGA-UPDATES" "$ROOT/update.sh" \
+  || fail "обновлялка не ловит тревогу настроек — сообщение осядет в логе, который никто не читает"
+grep -q "9>&-" "$ROOT/update.sh" \
+  || fail "замок обновления наследуется демоном — следующие обновления будут тихо пропускаться"
+echo "✓ тревога доходит до владельца, замок не утекает в демон"
+
+# Е. Клиенту и оператору обещаем то, что происходит на самом деле.
+grep -rn -iE "раз в неделю|еженедельн|по понедельник" "$ROOT/README.md" "$ROOT/guides" >/dev/null 2>&1 \
+  && fail "клиенту всё ещё обещают обновления раз в неделю"
+echo "✓ тексты для клиента и оператора совпадают с реальным расписанием"
+
+# Ж. Установщик определяет все функции, которые зовёт. warn вызывался трижды,
+# определён не был — под set -e установка обрывалась на клиенте с ключом,
+# которому OpenRouter отдаёт только DeepSeek.
+for fn in $(grep -oE '^\s*(say|ok|warn|die) ' "$ROOT/install.sh" | tr -d ' ' | sort -u); do
+  grep -qE "^${fn}\(\)" "$ROOT/install.sh" || fail "install.sh зовёт ${fn}, но не определяет её — установка оборвётся"
+done
+echo "✓ установщик определяет все функции, которые вызывает"
+
+# З. Проверки сети в установщике не роняют установку при моргании связи.
+grep -qE 'curl [^|]*openrouter\.ai/api/v1/key.*\|\| echo' "$ROOT/install.sh" \
+  || fail "запрос баланса без перехвата — сбой сети оборвёт установку без объяснения"
+echo "✓ сбой сети при проверке баланса не обрывает установку"
 
 echo
 echo "============================================="
